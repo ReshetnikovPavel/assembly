@@ -1,0 +1,15 @@
+.data
+.globl greet
+greet:
+.string "Hello world!\n"
+
+.text
+.global main
+main:
+    mov %rax, $1
+    mov %rdi, $1
+    mov %rsi, $greet
+    mov %rdx, $13
+    syscall
+    mov %rax, $60
+    syscall
