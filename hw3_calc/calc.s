@@ -1,6 +1,11 @@
 .global _start
 
 .text
+exit_err:
+    mov $1, %rdi
+    jmp exit
+
+
 plus:
     add %rbx, %rax
     jmp read_arg
@@ -21,7 +26,7 @@ multiply:
 to_int:
 # reads a string from (%r8) and converts it into int;
 # after execution jumps to a value contained in %rdi
-# does not preserve %rax, %rbx, %rcx and %r8; so, save them somewhere :)
+# does not preserve %rax, %rbx, %rcx and %r8;
 # output is in %rax
     mov $0, %rax # a number
     mov $10, %rbx # 10 is a base
@@ -37,60 +42,66 @@ to_int_loop:
     inc %r8 # move index to next char
     jmp to_int_loop
 to_int_end:
-    jmp %rdi
+    jmp *%rdi
 
 
 _start:
     pop %r8 # number of arguments
-    pop %r8 # binary name
-    mov $1, %rdi
-    jz exit
 
-    pop %r8 # pointer to argument string
-    mov $read_arg, %rdi # where to go after to_int execution
-    jmp to_int
+    cmp $1, %r8 # at least one argument besides binary name is needed
+    je exit_err
+
+    pop %r8 # binary name
+    mov $plus, %rsi # %rsi contains current operation. The first arg is evaluated as 0 + arg
 
 read_arg:
     pop %r8
-    test %r8,  %r8
+    test %r8, %r8
     jz write_output
-    movb (%r8), %bl # current argument, operation or number
+    movb (%r8), %bl # current argument
 
+# decide if we need to parse a number or an operation
+    not %r9
+    test %r9, %r9
+    jnz handle_number
 
 check_plus:
-    cmp $43, %rbx # if argument is `+`
+    cmpb $43, %bl # if argument is `+`
     jne check_minus
     mov $plus, %rsi # rbx is current operation, in this case `+`
     je read_arg
 
 check_minus:
-    cmp $45, %rbx # if argument is `-`
+    cmpb $45, %bl # if argument is `-`
     jne check_divide
     mov $minus, %rsi
     je read_arg
 
 check_divide:
-    cmp $47, %rbx # if argument is `/`
+    cmpb $47, %bl # if argument is `/`
     jne check_multiply
     mov $divide, %rsi
     je read_arg
 
 check_multiply:
-    cmp $120, %rbx # if argument is `x`
-    jne handle_second_arg
+    cmpb $120, %bl # if argument is `x`
+    jne exit_err
     mov $multiply, %rsi
     je read_arg
 
-handle_second_arg:
+handle_number:
     push %rax
     mov $execute, %rdi
     jmp to_int
 execute:
     mov %rax, %rbx
     pop %rax
-    jmp %rsi
+    jmp *%rsi
 
 write_output:
+    test %r9, %r9 # the last argument cannot be an operation
+    jz exit_err
+
     mov $str_end-2, %rsi # byte before \n
     mov $10, %rbx
 write_digits_loop:
