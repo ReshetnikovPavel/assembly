@@ -1,0 +1,10 @@
+.global main
+.text
+main:
+    lea $name, %rdi
+    mov 100500, %rsi
+    call printf
+.data
+
+name:
+    .asciz "hello %d"

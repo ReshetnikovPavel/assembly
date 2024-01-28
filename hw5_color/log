@@ -1,0 +1,1162 @@
+#include <scheme.h>
+#include <sstream>
+
+#include <functional>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <vector>
+#include <error.h>
+#include <object.h>
+#include <parser.h>
+#include <tokenizer.h>
+
+class Context;
+
+std::shared_ptr<Object> Eval(std::shared_ptr<Object> object, std::shared_ptr<Context> ctx);
+
+class Callable : public std::enable_shared_from_this<Callable> {
+public:
+    virtual std::shared_ptr<Object> Call(std::shared_ptr<Object> arguments,
+                                         std::shared_ptr<Context> ctx) = 0;
+    virtual ~Callable() = default;
+};
+
+class Context {
+public:
+    Context(std::optional<std::shared_ptr<Context>> parent) : parent_(parent) {
+    }
+
+    std::optional<std::shared_ptr<Context>> GetParent() {
+        return parent_;
+    }
+
+    std::shared_ptr<Callable> Get(std::shared_ptr<Symbol> symbol) {
+        // std::cout << symbol->GetName() << '\n';
+        if (namespace_.contains(symbol->GetName())) {
+            return namespace_[symbol->GetName()];
+        } else if (parent_ != std::nullopt) {
+            return parent_->get()->Get(symbol);
+        } else {
+            // std::cout << "NAME NOT FOUND::: " << symbol->GetName() << '\n';
+            throw NameError("I don't know this name, mate!");
+        }
+    }
+
+    void Define(std::string name, std::shared_ptr<Callable> callable) {
+        if (!namespace_.contains(name)) {
+            namespace_.insert({name, callable});
+        } else {
+            namespace_[name] = callable;
+            // throw NameError("You have already defined this variable, forgetful human");
+        }
+    }
+
+    void Set(std::string name, std::shared_ptr<Callable> callable) {
+        if (namespace_.contains(name)) {
+            namespace_[name] = callable;
+        } else {
+            if (parent_ != std::nullopt) {
+                return (*parent_)->Set(name, callable);
+            }
+            std::string err_mess(
+                "Dude, you are trying to set a value to an unidentified variable: ");
+            err_mess.append(name);
+            throw NameError(err_mess);
+        }
+    }
+
+private:
+    std::optional<std::shared_ptr<Context>> parent_ = std::nullopt;
+    std::unordered_map<std::string, std::shared_ptr<Callable>> namespace_;
+};
+
+class Variable : public Callable {
+public:
+    Variable(std::shared_ptr<Object> obj) : obj_(obj) {
+    }
+
+    std::shared_ptr<Object> Call(std::shared_ptr<Object> arguments, std::shared_ptr<Context> ctx) {
+        return obj_;
+    }
+
+private:
+    std::shared_ptr<Object> obj_;
+};
+
+class LambdaFunc : public Callable {
+public:
+    LambdaFunc(std::shared_ptr<Lambda> lambda, std::shared_ptr<Context> ctx)
+        : lambda_(lambda), ctx_(ctx) {
+    }
+
+    std::shared_ptr<Object> Call(std::shared_ptr<Object> arguments, std::shared_ptr<Context> ctx) {
+        std::shared_ptr<Object> parameters = lambda_->GetParams();
+        auto new_ctx = std::make_shared<Context>(Context(ctx_));
+        while (arguments != nullptr || parameters != nullptr) {
+            auto args = As<Cell>(arguments);
+            auto params = As<Cell>(parameters);
+            auto name = As<Symbol>(params->GetFirst());
+            arguments = args->GetSecond();
+            args = As<Cell>(args);
+            new_ctx->Define(name->GetName(),
+                            std::make_shared<Variable>(Variable(args->GetFirst())));
+
+            arguments = args->GetSecond();
+            parameters = params->GetSecond();
+        }
+
+        std::shared_ptr<Object> res = nullptr;
+        for (auto body : lambda_->GetBodies()) {
+            std::cout << "here\n";
+            res = Eval(body, new_ctx);
+        }
+        std::cout << "LAMBDA\n";
+        return res;
+    }
+
+private:
+    std::shared_ptr<Lambda> lambda_;
+    std::shared_ptr<Context> ctx_;
+};
+
+std::shared_ptr<Object> Eval(std::shared_ptr<Object> object, std::shared_ptr<Context> ctx) {
+    if (object == nullptr) {
+        //  std::cout << "nullptr\n";
+        return nullptr;
+    }
+    if (Is<Number>(object) || Is<True>(object) || Is<False>(object)) {
+        //  std::cout << object->ToString() << '\n';
+        return object;
+
+    } else if (Is<Symbol>(object)) {
+        auto symbol = As<Symbol>(object);
+        //  std::cout << symbol->GetName() << '\n';
+        return object;
+
+    } else if (Is<Quote>(object)) {
+        auto quote = As<Quote>(object);
+        //  std::cout << "quote" << '\n';
+        return quote;
+
+    } else if (Is<Define>(object)) {
+        auto define = As<Define>(object);
+        auto s = define->GetSymbol();
+        auto ctx_parent = ctx->GetParent();
+        if (ctx_parent == nullptr) {
+            throw RuntimeError("What is wrong with being adopted? - I don't know... NO PARENTS?!");
+        }
+        auto expr = Eval(define->GetExpr(), ctx);
+        if (Is<Lambda>(expr)) {
+            auto lambda = As<Lambda>(expr);
+            (*ctx_parent)->Define(s->GetName(), std::make_shared<LambdaFunc>(LambdaFunc(lambda, ctx)));
+        } else {
+            auto variable = std::make_shared<Variable>(Variable(expr));
+            (*ctx_parent)->Define(s->GetName(), variable);
+        }
+        return define;
+
+    } else if (Is<Lambda>(object)) {
+        return object;
+
+    } else if (Is<Cell>(object)) {
+        // std::cout << "cell\n";
+        auto cell = As<Cell>(object);
+        if (Is<Cell>(cell->GetFirst()) && Is<Lambda>(As<Cell>(cell->GetFirst())->GetFirst())) {
+            auto lambda = As<Lambda>(As<Cell>(cell->GetFirst())->GetFirst());
+            return LambdaFunc(lambda, ctx).Call(cell->GetSecond(), ctx);
+        }
+        auto left_evaled = Eval(cell->GetFirst(), std::make_shared<Context>(Context(ctx)));
+        if (Is<Symbol>(left_evaled)) {
+            // std::cout << "left symbol\n";
+            auto symbol = As<Symbol>(left_evaled);
+            auto callable = ctx->Get(symbol);
+            auto res = callable.get()->Call(cell->GetSecond(), ctx);
+            // std::cout << "After call " << res->ToString() << '\n';
+            return res;
+
+        } else if (Is<Define>(left_evaled)) {
+            return left_evaled;
+        } else if (Is<Lambda>(left_evaled)) {
+            return left_evaled;
+        } else {
+            //  std::cout << "left not symbol\n";
+            auto right_evaled = Eval(cell->GetSecond(), std::make_shared<Context>(Context(ctx)));
+            return std::make_shared<Cell>(Cell(left_evaled, right_evaled));
+        }
+    }
+    throw RuntimeError("The implementation of this object is not ready yet, mate");
+}
+
+class IsBoolean : public Callable {
+public:
+    std::shared_ptr<Object> Call(std::shared_ptr<Object> arguments, std::shared_ptr<Context> ctx) {
+        //  std::cout << "called boolean?\n";
+        if (!Is<Cell>(arguments)) {
+            throw RuntimeError("Wrong type, mate");
+        }
+        auto args = As<Cell>(arguments);
+        if (args->GetSecond() != nullptr) {
+            throw RuntimeError("Only one argument, mate");
+        }
+        auto evaluated_args = Eval(args->GetFirst(), ctx);
+        ////  std::cout << "Am I here? " << evaluated_args->ToString() << '\n';
+        if (Is<True>(evaluated_args) || Is<False>(evaluated_args)) {
+            return std::make_shared<True>(True());
+        }
+        return std::make_shared<False>(False());
+    }
+};
+
+class Not : public Callable {
+public:
+    std::shared_ptr<Object> Call(std::shared_ptr<Object> arguments, std::shared_ptr<Context> ctx) {
+        if (!Is<Cell>(arguments)) {
+            throw RuntimeError("Wrong type, mate");
+        }
+        auto args = As<Cell>(arguments);
+        if (args->GetSecond() != nullptr) {
+            throw RuntimeError("Only one argument, mate");
+        }
+        auto evaluated_args = Eval(args->GetFirst(), ctx);
+        if (Is<False>(evaluated_args)) {
+            return std::make_shared<True>(True());
+        }
+        return std::make_shared<False>(False());
+    }
+};
+
+class IsNumber : public Callable {
+public:
+    std::shared_ptr<Object> Call(std::shared_ptr<Object> arguments, std::shared_ptr<Context> ctx) {
+        if (!Is<Cell>(arguments)) {
+            throw RuntimeError("Wrong type, mate");
+        }
+        auto args = As<Cell>(arguments);
+        if (args->GetSecond() != nullptr) {
+            throw RuntimeError("Only one argument, mate");
+        }
+        auto evaluated_args = Eval(args->GetFirst(), ctx);
+        if (Is<Number>(evaluated_args)) {
+            return std::make_shared<True>(True());
+        }
+        return std::make_shared<False>(False());
+    }
+};
+
+class IsPair : public Callable {
+public:
+    std::shared_ptr<Object> Call(std::shared_ptr<Object> arguments, std::shared_ptr<Context> ctx) {
+        if (!Is<Cell>(arguments)) {
+            throw RuntimeError("Wrong type, mate");
+        }
+        auto args = As<Cell>(arguments);
+        if (args->GetSecond() != nullptr) {
+            throw RuntimeError("Only one argument, mate");
+        }
+        auto evaluated_args = Eval(args->GetFirst(), ctx);
+        if (Is<Quote>(evaluated_args)) {
+            auto quote = As<Quote>(evaluated_args);
+            auto obj = quote->GetObject();
+            if (Is<Cell>(obj)) {
+                auto cell = As<Cell>(obj);
+                if (cell->GetFirst() != nullptr && cell->GetSecond() != nullptr) {
+                    return std::make_shared<True>(True());
+                }
+            }
+        }
+        return std::make_shared<False>(False());
+    }
+};
+
+class IsNull : public Callable {
+public:
+    std::shared_ptr<Object> Call(std::shared_ptr<Object> arguments, std::shared_ptr<Context> ctx) {
+        if (!Is<Cell>(arguments)) {
+            throw RuntimeError("Wrong type, mate");
+        }
+        auto args = As<Cell>(arguments);
+        if (args->GetSecond() != nullptr) {
+            throw RuntimeError("Only one argument, mate");
+        }
+        auto evaluated_args = Eval(args->GetFirst(), ctx);
+        if (Is<Quote>(evaluated_args)) {
+            auto quote = As<Quote>(evaluated_args);
+            if (quote->GetObject() == nullptr) {
+                return std::make_shared<True>(True());
+            }
+        }
+        return std::make_shared<False>(False());
+    }
+};
+
+class IsList : public Callable {
+public:
+    std::shared_ptr<Object> Call(std::shared_ptr<Object> arguments, std::shared_ptr<Context> ctx) {
+        if (!Is<Cell>(arguments)) {
+            throw RuntimeError("Wrong type, mate");
+        }
+        auto args = As<Cell>(arguments);
+        if (args->GetSecond() != nullptr) {
+            throw RuntimeError("Only one argument, mate");
+        }
+        auto evaluated_args = Eval(args->GetFirst(), ctx);
+        if (Is<Quote>(evaluated_args)) {
+            auto quote = As<Quote>(evaluated_args);
+            auto obj = quote->GetObject();
+            while (Is<Cell>(obj)) {
+                auto cell = As<Cell>(obj);
+                obj = cell->GetSecond();
+            }
+            if (obj == nullptr) {
+                return std::make_shared<True>(True());
+            }
+        }
+        return std::make_shared<False>(False());
+    }
+};
+
+class IsSymbol : public Callable {
+public:
+    std::shared_ptr<Object> Call(std::shared_ptr<Object> arguments, std::shared_ptr<Context> ctx) {
+        if (!Is<Cell>(arguments)) {
+            throw RuntimeError("Wrong type, mate");
+        }
+        auto args = As<Cell>(arguments);
+        if (args->GetSecond() != nullptr) {
+            throw RuntimeError("Only one argument, mate");
+        }
+        auto evaluated_args = Eval(args->GetFirst(), ctx);
+        if (Is<Quote>(evaluated_args)) {
+            auto quote = As<Quote>(evaluated_args);
+            auto obj = quote->GetObject();
+            if (Is<Symbol>(obj)) {
+                return std::make_shared<True>(True());
+            }
+        }
+        return std::make_shared<False>(False());
+    }
+};
+
+class If : public Callable {
+public:
+    std::shared_ptr<Object> Call(std::shared_ptr<Object> arguments, std::shared_ptr<Context> ctx) {
+        if (!Is<Cell>(arguments)) {
+            throw SyntaxError("Wrong type, mate");
+        }
+        auto args = As<Cell>(arguments);
+        auto second_arg = args->GetSecond();
+        if (!Is<Cell>(second_arg)) {
+            throw SyntaxError("ain't no body");
+        }
+        auto body = As<Cell>(second_arg);
+        auto predicate = Eval(args->GetFirst(), ctx);
+        if (Is<True>(predicate)) {
+            return Eval(body->GetFirst(), ctx);
+        } else if (Is<False>(predicate)) {
+            auto false_body = body->GetSecond();
+            if (Is<Cell>(false_body)) {
+                auto cell = As<Cell>(false_body);
+                if (cell->GetSecond() != nullptr) {
+                    throw SyntaxError("too much args");
+                }
+                return Eval(cell->GetFirst(), ctx);
+            }
+            return Eval(body->GetSecond(), ctx);
+        } else {
+            throw SyntaxError("Predicate is not bool");
+        }
+    }
+};
+
+class Abs : public Callable {
+public:
+    std::shared_ptr<Object> Call(std::shared_ptr<Object> arguments, std::shared_ptr<Context> ctx) {
+        if (!Is<Cell>(arguments)) {
+            throw RuntimeError("Wrong type, mate");
+        }
+        auto args = As<Cell>(arguments);
+        if (args->GetSecond() != nullptr) {
+            throw RuntimeError("Only one argument, mate");
+        }
+        auto evaluated_args = Eval(args->GetFirst(), ctx);
+        if (Is<Number>(evaluated_args)) {
+            auto number = As<Number>(evaluated_args);
+            return std::make_shared<Number>(Number(std::abs(number->GetValue())));
+        }
+        throw RuntimeError("Wrong type, mate");
+    }
+};
+
+class Equal : public Callable {
+public:
+    std::shared_ptr<Object> Call(std::shared_ptr<Object> arguments, std::shared_ptr<Context> ctx) {
+        std::optional<int> value = std::nullopt;
+        while (arguments != nullptr && Is<Cell>(arguments)) {
+            auto args = As<Cell>(arguments);
+            auto current_arg = Eval(args->GetFirst(), ctx);
+            if (!Is<Number>(current_arg)) {
+                throw RuntimeError("`=` only supports numbers, mate!");
+            }
+            auto number = As<Number>(current_arg);
+            if (value == std::nullopt) {
+                value = number->GetValue();
+            } else {
+                if (value != number->GetValue()) {
+                    return std::make_shared<False>(False());
+                }
+            }
+            arguments = args->GetSecond();
+        }
+        if (arguments != nullptr) {
+            auto current_arg = Eval(arguments, ctx);
+            if (!Is<Number>(current_arg)) {
+                throw RuntimeError("`=` only supports numbers, mate!");
+            }
+            auto number = As<Number>(current_arg);
+            if (value == std::nullopt) {
+                value = number->GetValue();
+            } else {
+                if (value != number->GetValue()) {
+                    return std::make_shared<False>(False());
+                }
+            }
+        }
+        return std::make_shared<True>(True());
+    }
+};
+
+class Greater : public Callable {
+    std::shared_ptr<Object> Call(std::shared_ptr<Object> arguments, std::shared_ptr<Context> ctx) {
+        std::optional<int> value = std::nullopt;
+        while (arguments != nullptr && Is<Cell>(arguments)) {
+            auto args = As<Cell>(arguments);
+            auto current_arg = Eval(args->GetFirst(), ctx);
+            if (!Is<Number>(current_arg)) {
+                throw RuntimeError("`>` only supports numbers, mate!");
+            }
+            auto number = As<Number>(current_arg);
+            if (value == std::nullopt) {
+                value = number->GetValue();
+            } else {
+                if (value > number->GetValue()) {
+                    value = number->GetValue();
+                } else {
+                    return std::make_shared<False>(False());
+                }
+            }
+            arguments = args->GetSecond();
+        }
+        if (arguments != nullptr) {
+            auto current_arg = Eval(arguments, ctx);
+            if (!Is<Number>(current_arg)) {
+                throw RuntimeError("`>` only supports numbers, mate!");
+            }
+            auto number = As<Number>(current_arg);
+            if (value == std::nullopt) {
+                value = number->GetValue();
+            } else {
+                if (value > number->GetValue()) {
+                    value = number->GetValue();
+                } else {
+                    return std::make_shared<False>(False());
+                }
+            }
+        }
+        return std::make_shared<True>(True());
+    }
+};
+
+class Less : public Callable {
+    std::shared_ptr<Object> Call(std::shared_ptr<Object> arguments, std::shared_ptr<Context> ctx) {
+        std::optional<int> value = std::nullopt;
+        while (arguments != nullptr && Is<Cell>(arguments)) {
+            auto args = As<Cell>(arguments);
+            auto current_arg = Eval(args->GetFirst(), ctx);
+            if (!Is<Number>(current_arg)) {
+                throw RuntimeError("`<` only supports numbers, mate!");
+            }
+            auto number = As<Number>(current_arg);
+            if (value == std::nullopt) {
+                value = number->GetValue();
+            } else {
+                if (value < number->GetValue()) {
+                    value = number->GetValue();
+                } else {
+                    return std::make_shared<False>(False());
+                }
+            }
+            arguments = args->GetSecond();
+        }
+        if (arguments != nullptr) {
+            auto current_arg = Eval(arguments, ctx);
+            if (!Is<Number>(current_arg)) {
+                throw RuntimeError("`<` only supports numbers, mate!");
+            }
+            auto number = As<Number>(current_arg);
+            if (value == std::nullopt) {
+                value = number->GetValue();
+            } else {
+                if (value < number->GetValue()) {
+                    value = number->GetValue();
+                } else {
+                    return std::make_shared<False>(False());
+                }
+            }
+        }
+        return std::make_shared<True>(True());
+    }
+};
+
+class GreaterOrEqual : public Callable {
+    std::shared_ptr<Object> Call(std::shared_ptr<Object> arguments, std::shared_ptr<Context> ctx) {
+        std::optional<int> value = std::nullopt;
+        while (arguments != nullptr && Is<Cell>(arguments)) {
+            auto args = As<Cell>(arguments);
+            auto current_arg = Eval(args->GetFirst(), ctx);
+            if (!Is<Number>(current_arg)) {
+                throw RuntimeError("`>=` only supports numbers, mate!");
+            }
+            auto number = As<Number>(current_arg);
+            if (value == std::nullopt) {
+                value = number->GetValue();
+            } else {
+                if (value >= number->GetValue()) {
+                    value = number->GetValue();
+                } else {
+                    return std::make_shared<False>(False());
+                }
+            }
+            arguments = args->GetSecond();
+        }
+        if (arguments != nullptr) {
+            auto current_arg = Eval(arguments, ctx);
+            if (!Is<Number>(current_arg)) {
+                throw RuntimeError("`>=` only supports numbers, mate!");
+            }
+            auto number = As<Number>(current_arg);
+            if (value == std::nullopt) {
+                value = number->GetValue();
+            } else {
+                if (value >= number->GetValue()) {
+                    value = number->GetValue();
+                } else {
+                    return std::make_shared<False>(False());
+                }
+            }
+        }
+        return std::make_shared<True>(True());
+    }
+};
+
+class LessOrEqual : public Callable {
+    std::shared_ptr<Object> Call(std::shared_ptr<Object> arguments, std::shared_ptr<Context> ctx) {
+        std::optional<int> value = std::nullopt;
+        while (arguments != nullptr && Is<Cell>(arguments)) {
+            auto args = As<Cell>(arguments);
+            auto current_arg = Eval(args->GetFirst(), ctx);
+            if (!Is<Number>(current_arg)) {
+                throw RuntimeError("`<=` only supports numbers, mate!");
+            }
+            auto number = As<Number>(current_arg);
+            if (value == std::nullopt) {
+                value = number->GetValue();
+            } else {
+                if (value <= number->GetValue()) {
+                    value = number->GetValue();
+                } else {
+                    return std::make_shared<False>(False());
+                }
+            }
+            arguments = args->GetSecond();
+        }
+        if (arguments != nullptr) {
+            auto current_arg = Eval(arguments, ctx);
+            if (!Is<Number>(current_arg)) {
+                throw RuntimeError("`<=` only supports numbers, mate!");
+            }
+            auto number = As<Number>(current_arg);
+            if (value == std::nullopt) {
+                value = number->GetValue();
+            } else {
+                if (value <= number->GetValue()) {
+                    value = number->GetValue();
+                } else {
+                    return std::make_shared<False>(False());
+                }
+            }
+        }
+        return std::make_shared<True>(True());
+    }
+};
+
+class And : public Callable {
+    std::shared_ptr<Object> Call(std::shared_ptr<Object> arguments, std::shared_ptr<Context> ctx) {
+        // std::cout << "Called And\n";
+        std::shared_ptr<Object> value = std::make_shared<True>(True());
+        while (arguments != nullptr && Is<Cell>(arguments)) {
+            // std::cout << "In a loop\n";
+            auto args = As<Cell>(arguments);
+            auto current_arg = Eval(args->GetFirst(), ctx);
+            if (Is<Symbol>(current_arg) || Is<Cell>(current_arg)) {
+                throw RuntimeError("type is not self-evaluating");
+            }
+            if (Is<False>(current_arg)) {
+                return current_arg;
+            } else {
+                value = current_arg;
+            }
+            arguments = args->GetSecond();
+        }
+        if (arguments != nullptr) {
+            auto current_arg = Eval(arguments, ctx);
+            if (Is<Symbol>(current_arg) || Is<Cell>(current_arg)) {
+                throw RuntimeError("type is not self-evaluating");
+            }
+            if (Is<False>(current_arg)) {
+                return current_arg;
+            } else {
+                value = current_arg;
+            }
+        }
+        return value;
+    }
+};
+
+class Or : public Callable {
+    std::shared_ptr<Object> Call(std::shared_ptr<Object> arguments, std::shared_ptr<Context> ctx) {
+        // std::cout << "Am I in Or?\n";
+        std::shared_ptr<Object> value = std::make_shared<False>(False());
+        while (arguments != nullptr && Is<Cell>(arguments)) {
+            auto args = As<Cell>(arguments);
+            auto current_arg = Eval(args->GetFirst(), ctx);
+            if (Is<Symbol>(current_arg) || Is<Cell>(current_arg)) {
+                throw RuntimeError("type is not self-evaluating");
+            }
+            if (Is<True>(current_arg)) {
+                return current_arg;
+            } else {
+                value = current_arg;
+            }
+            arguments = args->GetSecond();
+        }
+        if (arguments != nullptr) {
+            auto current_arg = Eval(arguments, ctx);
+            if (Is<Symbol>(current_arg) || Is<Cell>(current_arg)) {
+                throw RuntimeError("type is not self-evaluating");
+            }
+            if (Is<True>(current_arg)) {
+                return current_arg;
+            } else {
+                value = current_arg;
+            }
+        }
+        return value;
+    }
+};
+
+class QuoteCallable : public Callable {
+public:
+    std::shared_ptr<Object> Call(std::shared_ptr<Object> arguments, std::shared_ptr<Context> ctx) {
+        if (!Is<Cell>(arguments)) {
+            throw RuntimeError("Wrong type, mate");
+        }
+        auto args = As<Cell>(arguments);
+
+        auto quote = std::make_shared<Quote>(Quote(args->GetFirst()));
+        return quote;
+    }
+};
+
+class Plus : public Callable {
+public:
+    std::shared_ptr<Object> Call(std::shared_ptr<Object> arguments, std::shared_ptr<Context> ctx) {
+        int value = 0;
+        while (arguments != nullptr && Is<Cell>(arguments)) {
+            auto args = As<Cell>(arguments);
+            auto current_arg = Eval(args->GetFirst(), ctx);
+            if (Is<Number>(current_arg) || Is<Symbol>(current_arg)) {
+
+                if (Is<Symbol>(current_arg)) {
+                    auto obj = ctx->Get(As<Symbol>(current_arg))->Call(nullptr, nullptr);
+                    if (!Is<Number>(obj)) {
+                        throw RuntimeError("Wrong type");
+                    }
+                    current_arg = obj;
+                }
+
+                auto number = As<Number>(current_arg);
+                value += number->GetValue();
+            } else {
+                throw RuntimeError("Wrong type");
+            }
+
+            arguments = args->GetSecond();
+        }
+        if (arguments != nullptr) {
+            auto current_arg = Eval(arguments, ctx);
+            if (Is<Number>(current_arg) || Is<Symbol>(current_arg)) {
+                if (Is<Symbol>(current_arg)) {
+                    auto obj = ctx->Get(As<Symbol>(current_arg))->Call(nullptr, nullptr);
+                    if (!Is<Number>(obj)) {
+                        throw RuntimeError("Wrong type");
+                    }
+                    current_arg = obj;
+                }
+
+                auto number = As<Number>(current_arg);
+                value += number->GetValue();
+            } else {
+                throw RuntimeError("Wrong type");
+            }
+        }
+        return std::make_shared<Number>(value);
+    }
+};
+
+class Minus : public Callable {
+public:
+    std::shared_ptr<Object> Call(std::shared_ptr<Object> arguments, std::shared_ptr<Context> ctx) {
+        if (arguments == nullptr) {
+            throw RuntimeError("At least one argument is needed");
+        }
+        int value = 0;
+        bool is_first = true;
+        while (arguments != nullptr && Is<Cell>(arguments)) {
+            auto args = As<Cell>(arguments);
+            auto current_arg = Eval(args->GetFirst(), ctx);
+            if (Is<Number>(current_arg) || Is<Symbol>(current_arg)) {
+                if (Is<Symbol>(current_arg)) {
+                    auto obj = ctx->Get(As<Symbol>(current_arg))->Call(nullptr, nullptr);
+                    if (!Is<Number>(obj)) {
+                        throw RuntimeError("Wrong type");
+                    }
+                    current_arg = obj;
+                }
+
+                auto number = As<Number>(current_arg);
+                if (is_first) {
+                    value += number->GetValue();
+                    is_first = false;
+                } else {
+                    value -= number->GetValue();
+                }
+            } else {
+                throw RuntimeError("Wrong type");
+            }
+            arguments = args->GetSecond();
+        }
+        if (arguments != nullptr) {
+            auto current_arg = Eval(arguments, ctx);
+            if (Is<Number>(current_arg) || Is<Symbol>(current_arg)) {
+                if (Is<Symbol>(current_arg)) {
+                    auto obj = ctx->Get(As<Symbol>(current_arg))->Call(nullptr, nullptr);
+                    if (!Is<Number>(obj)) {
+                        throw RuntimeError("Wrong type");
+                    }
+                    current_arg = obj;
+                }
+                auto number = As<Number>(current_arg);
+                if (is_first) {
+                    value += number->GetValue();
+                    is_first = false;
+                } else {
+                    value -= number->GetValue();
+                }
+            } else {
+                throw RuntimeError("Wrong type");
+            }
+        }
+        return std::make_shared<Number>(value);
+    }
+};
+
+class Multiply : public Callable {
+public:
+    std::shared_ptr<Object> Call(std::shared_ptr<Object> arguments, std::shared_ptr<Context> ctx) {
+        int value = 1;
+        while (arguments != nullptr && Is<Cell>(arguments)) {
+            auto args = As<Cell>(arguments);
+            auto current_arg = Eval(args->GetFirst(), ctx);
+            if (Is<Number>(current_arg) || Is<Symbol>(current_arg)) {
+                if (Is<Symbol>(current_arg)) {
+                    auto obj = ctx->Get(As<Symbol>(current_arg))->Call(nullptr, nullptr);
+                    if (!Is<Number>(obj)) {
+                        throw RuntimeError("Wrong type");
+                    }
+                    current_arg = obj;
+                }
+                auto number = As<Number>(current_arg);
+                value *= number->GetValue();
+            } else {
+                throw RuntimeError("Wrong type");
+            }
+
+            arguments = args->GetSecond();
+        }
+        if (arguments != nullptr) {
+            auto current_arg = Eval(arguments, ctx);
+            if (Is<Number>(current_arg) || Is<Symbol>(current_arg)) {
+                if (Is<Symbol>(current_arg)) {
+                    auto obj = ctx->Get(As<Symbol>(current_arg))->Call(nullptr, nullptr);
+                    if (!Is<Number>(obj)) {
+                        throw RuntimeError("Wrong type");
+                    }
+                    current_arg = obj;
+                }
+                auto number = As<Number>(current_arg);
+                value *= number->GetValue();
+            } else {
+                throw RuntimeError("Wrong type");
+            }
+        }
+        return std::make_shared<Number>(value);
+    }
+};
+
+class Divide : public Callable {
+public:
+    std::shared_ptr<Object> Call(std::shared_ptr<Object> arguments, std::shared_ptr<Context> ctx) {
+        if (arguments == nullptr) {
+            throw RuntimeError("At least one argument is needed");
+        }
+        int value = 1;
+        bool is_first = true;
+        while (arguments != nullptr && Is<Cell>(arguments)) {
+            auto args = As<Cell>(arguments);
+            auto current_arg = Eval(args->GetFirst(), ctx);
+            if (Is<Number>(current_arg) || Is<Symbol>(current_arg)) {
+                if (Is<Symbol>(current_arg)) {
+                    auto obj = ctx->Get(As<Symbol>(current_arg))->Call(nullptr, nullptr);
+                    if (!Is<Number>(obj)) {
+                        throw RuntimeError("Wrong type");
+                    }
+                    current_arg = obj;
+                }
+                auto number = As<Number>(current_arg);
+
+                if (is_first) {
+                    value *= number->GetValue();
+                    is_first = false;
+                } else {
+                    value /= number->GetValue();
+                }
+            } else {
+                throw RuntimeError("Wrong type");
+            }
+
+            arguments = args->GetSecond();
+        }
+        if (arguments != nullptr) {
+            auto current_arg = Eval(arguments, ctx);
+            if (Is<Number>(current_arg) || Is<Symbol>(current_arg)) {
+                if (Is<Symbol>(current_arg)) {
+                    auto obj = ctx->Get(As<Symbol>(current_arg))->Call(nullptr, nullptr);
+                    if (!Is<Number>(obj)) {
+                        throw RuntimeError("Wrong type");
+                    }
+                    current_arg = obj;
+                }
+
+                auto number = As<Number>(current_arg);
+                if (is_first) {
+                    value *= number->GetValue();
+                    is_first = false;
+                } else {
+                    value /= number->GetValue();
+                }
+            } else {
+                throw RuntimeError("Wrong type");
+            }
+        }
+        return std::make_shared<Number>(value);
+    }
+};
+
+class Max : public Callable {
+public:
+    std::shared_ptr<Object> Call(std::shared_ptr<Object> arguments, std::shared_ptr<Context> ctx) {
+        if (arguments == nullptr) {
+            throw RuntimeError("At least one argument is needed");
+        }
+        int value = INT_MIN;
+        while (arguments != nullptr && Is<Cell>(arguments)) {
+            auto args = As<Cell>(arguments);
+            auto current_arg = Eval(args->GetFirst(), ctx);
+            if (Is<Number>(current_arg) || Is<Symbol>(current_arg)) {
+                if (Is<Symbol>(current_arg)) {
+                    auto obj = ctx->Get(As<Symbol>(current_arg))->Call(nullptr, nullptr);
+                    if (!Is<Number>(obj)) {
+                        throw RuntimeError("Wrong type");
+                    }
+                    current_arg = obj;
+                }
+                auto number = As<Number>(current_arg);
+                if (value < number->GetValue()) {
+                    value = number->GetValue();
+                }
+            } else {
+                throw RuntimeError("Wrong type");
+            }
+
+            arguments = args->GetSecond();
+        }
+        if (arguments != nullptr) {
+            auto current_arg = Eval(arguments, ctx);
+            if (Is<Number>(current_arg) || Is<Symbol>(current_arg)) {
+                if (Is<Symbol>(current_arg)) {
+                    auto obj = ctx->Get(As<Symbol>(current_arg))->Call(nullptr, nullptr);
+                    if (!Is<Number>(obj)) {
+                        throw RuntimeError("Wrong type");
+                    }
+                    current_arg = obj;
+                }
+                auto number = As<Number>(current_arg);
+                if (value < number->GetValue()) {
+                    value = number->GetValue();
+                }
+            } else {
+                throw RuntimeError("Wrong type");
+            }
+        }
+        return std::make_shared<Number>(value);
+    }
+};
+
+class Min : public Callable {
+public:
+    std::shared_ptr<Object> Call(std::shared_ptr<Object> arguments, std::shared_ptr<Context> ctx) {
+        if (arguments == nullptr) {
+            throw RuntimeError("At least one argument is needed");
+        }
+        int value = INT_MAX;
+        while (arguments != nullptr && Is<Cell>(arguments)) {
+            auto args = As<Cell>(arguments);
+            auto current_arg = Eval(args->GetFirst(), ctx);
+            if (Is<Number>(current_arg) || Is<Symbol>(current_arg)) {
+                if (Is<Symbol>(current_arg)) {
+                    auto obj = ctx->Get(As<Symbol>(current_arg))->Call(nullptr, nullptr);
+                    if (!Is<Number>(obj)) {
+                        throw RuntimeError("Wrong type");
+                    }
+                    current_arg = obj;
+                }
+
+                auto number = As<Number>(current_arg);
+                if (value > number->GetValue()) {
+                    value = number->GetValue();
+                }
+            } else {
+                throw RuntimeError("Wrong type");
+            }
+
+            arguments = args->GetSecond();
+        }
+        if (arguments != nullptr) {
+            auto current_arg = Eval(arguments, ctx);
+            if (Is<Number>(current_arg) || Is<Symbol>(current_arg)) {
+                if (Is<Symbol>(current_arg)) {
+                    auto obj = ctx->Get(As<Symbol>(current_arg))->Call(nullptr, nullptr);
+                    if (!Is<Number>(obj)) {
+                        throw RuntimeError("Wrong type");
+                    }
+                    current_arg = obj;
+                }
+                auto number = As<Number>(current_arg);
+                if (value > number->GetValue()) {
+                    value = number->GetValue();
+                }
+            } else {
+                throw RuntimeError("Wrong type");
+            }
+        }
+        return std::make_shared<Number>(value);
+    }
+};
+
+class Set : public Callable {
+public:
+    std::shared_ptr<Object> Call(std::shared_ptr<Object> arguments, std::shared_ptr<Context> ctx) {
+        auto args = As<Cell>(arguments);
+        auto first_arg = args->GetFirst();
+        if (!Is<Symbol>(first_arg)) {
+            throw SyntaxError("set not symbol");
+        }
+        auto name = As<Symbol>(first_arg);
+        arguments = args->GetSecond();
+        args = As<Cell>(arguments);
+        auto second_arg = Eval(args->GetFirst(), ctx);
+        if (Is<Symbol>(second_arg)) {
+            second_arg = ctx->Get(As<Symbol>(second_arg))->Call(nullptr, nullptr);
+        }
+        ctx->Set(name->GetName(), std::make_shared<Variable>(Variable(second_arg)));
+        return second_arg;
+    }
+};
+
+class Cons : public Callable {
+public:
+    std::shared_ptr<Object> Call(std::shared_ptr<Object> arguments, std::shared_ptr<Context> ctx) {
+        auto args = As<Cell>(arguments);
+        auto first_arg = args->GetFirst();
+        args = As<Cell>(args->GetSecond());
+        auto second_arg = args->GetFirst();
+        if (args->GetSecond() != nullptr) {
+            throw RuntimeError("Wrong number of args, expected 2");
+        }
+        auto pair = std::make_shared<Cell>(first_arg, second_arg);
+        return std::make_shared<Quote>(Quote(pair));
+    }
+};
+
+class Car : public Callable {
+public:
+    std::shared_ptr<Object> Call(std::shared_ptr<Object> arguments, std::shared_ptr<Context> ctx) {
+        auto args = As<Cell>(arguments);
+        auto first_arg = args->GetFirst();
+        if (Is<Symbol>(first_arg)) {
+            first_arg = ctx->Get(As<Symbol>(first_arg))->Call(nullptr, ctx);
+        }
+        if (!Is<Quote>(first_arg)) {
+            throw RuntimeError("Only quotes");
+        }
+        auto object = As<Quote>(first_arg)->GetObject();
+        if (!Is<Cell>(object)) {
+            throw RuntimeError("Only cells");
+        }
+        auto pair = As<Cell>(object);
+        return pair->GetFirst();
+    }
+};
+
+class Cdr : public Callable {
+public:
+    std::shared_ptr<Object> Call(std::shared_ptr<Object> arguments, std::shared_ptr<Context> ctx) {
+        auto args = As<Cell>(Eval(arguments, ctx));
+        auto first_arg = args->GetFirst();
+        if (Is<Symbol>(first_arg)) {
+            first_arg = ctx->Get(As<Symbol>(first_arg))->Call(nullptr, ctx);
+        }
+        if (!Is<Quote>(first_arg)) {
+            throw RuntimeError("Only quotes");
+        }
+        auto object = As<Quote>(first_arg)->GetObject();
+        if (!Is<Cell>(object)) {
+            throw RuntimeError("Only cells");
+        }
+        auto pair = As<Cell>(object);
+        return pair->GetSecond();
+    }
+};
+
+class SetCar : public Callable {
+    std::shared_ptr<Object> Call(std::shared_ptr<Object> arguments, std::shared_ptr<Context> ctx) {
+        auto args = As<Cell>(arguments);
+        auto first_arg = args->GetFirst();
+        if (!Is<Symbol>(first_arg)) {
+            throw RuntimeError("Only symbols");
+        }
+        auto quote = As<Quote>(ctx->Get(As<Symbol>(first_arg))->Call(nullptr, ctx));
+        if (!Is<Quote>(quote)) {
+            throw RuntimeError("Only Quotes");
+        }
+        auto object = quote->GetObject();
+        auto pair = As<Cell>(object);
+        args = As<Cell>(args->GetSecond());
+        auto second_arg = args->GetFirst();
+        pair->SetFirst(second_arg);
+        if (args->GetSecond() != nullptr) {
+            throw RuntimeError("Wrong number of args, expected 2");
+        }
+        return quote;
+    }
+};
+
+class SetCdr : public Callable {
+    std::shared_ptr<Object> Call(std::shared_ptr<Object> arguments, std::shared_ptr<Context> ctx) {
+        auto args = As<Cell>(arguments);
+        auto first_arg = args->GetFirst();
+        if (!Is<Symbol>(first_arg)) {
+            throw RuntimeError("Only Quotes");
+        }
+        auto quote = As<Quote>(ctx->Get(As<Symbol>(first_arg))->Call(nullptr, ctx));
+        if (!Is<Quote>(quote)) {
+            throw RuntimeError("Only cells");
+        }
+        auto object = quote->GetObject();
+        auto pair = As<Cell>(object);
+        args = As<Cell>(args->GetSecond());
+        auto second_arg = args->GetFirst();
+        pair->SetSecond(second_arg);
+        if (args->GetSecond() != nullptr) {
+            throw RuntimeError("Wrong number of args, expected 2");
+        }
+        return quote;
+    }
+};
+
+std::shared_ptr<Context> CreateInitialContext() {
+    auto ctx = std::make_shared<Context>(Context(std::nullopt));
+    ctx->Define("boolean?", std::make_shared<IsBoolean>(IsBoolean()));
+    ctx->Define("not", std::make_shared<Not>(Not()));
+    ctx->Define("and", std::make_shared<And>(And()));
+    ctx->Define("or", std::make_shared<Or>(Or()));
+    ctx->Define("number?", std::make_shared<IsNumber>(IsNumber()));
+    ctx->Define("=", std::make_shared<Equal>(Equal()));
+    ctx->Define(">", std::make_shared<Greater>(Greater()));
+    ctx->Define("<", std::make_shared<Less>(Less()));
+    ctx->Define(">=", std::make_shared<GreaterOrEqual>(GreaterOrEqual()));
+    ctx->Define("<=", std::make_shared<LessOrEqual>(LessOrEqual()));
+    ctx->Define("quote", std::make_shared<QuoteCallable>(QuoteCallable()));
+    ctx->Define("+", std::make_shared<Plus>(Plus()));
+    ctx->Define("-", std::make_shared<Minus>(Minus()));
+    ctx->Define("*", std::make_shared<Multiply>(Multiply()));
+    ctx->Define("/", std::make_shared<Divide>(Divide()));
+    ctx->Define("max", std::make_shared<Max>(Max()));
+    ctx->Define("min", std::make_shared<Min>(Min()));
+    ctx->Define("abs", std::make_shared<Abs>(Abs()));
+    ctx->Define("pair?", std::make_shared<IsPair>(IsPair()));
+    ctx->Define("null?", std::make_shared<IsNull>(IsNull()));
+    ctx->Define("list?", std::make_shared<IsList>(IsList()));
+    ctx->Define("symbol?", std::make_shared<IsSymbol>(IsSymbol()));
+    ctx->Define("if", std::make_shared<If>(If()));
+    ctx->Define("set!", std::make_shared<Set>(Set()));
+    ctx->Define("cons", std::make_shared<Cons>(Cons()));
+    ctx->Define("car", std::make_shared<Car>(Car()));
+    ctx->Define("cdr", std::make_shared<Cdr>(Cdr()));
+    ctx->Define("set-car!", std::make_shared<SetCar>(SetCar()));
+    ctx->Define("set-cdr!", std::make_shared<SetCdr>(SetCdr()));
+
+    return ctx;
+}
+
+auto global_context = CreateInitialContext();
+
+std::string Scheme::Evaluate(const std::string& expression) {
+    //  std::cout << "bruh\n";
+    std::istringstream iss(expression);
+    std::istream* is = &iss;
+    //  std::cout << "Tokenize!\n";
+    auto tokenizer = Tokenizer(is);
+    //  std::cout << "Parse!\n";
+    auto ast = Read(&tokenizer);
+    if (Is<Cell>(ast)) {
+        // std::cout << "LIIIST\n";
+    }
+    auto ctx = global_context;
+    //  std::cout << "Eval!\n";
+    auto result = Eval(ast, ctx);
+    //  std::cout << "maybe here?\n";
+    if (Is<Symbol>(result)) {
+        auto name = As<Symbol>(result);
+        result = ctx->Get(name)->Call(nullptr, nullptr);
+    }
+
+    if (result == nullptr) {
+        return "()";
+    }
+    if (Is<Symbol>(result) || Is<Cell>(result)) {
+        throw RuntimeError("The result type is not self-evaluating");
+    }
+    return result->ToString();
+}

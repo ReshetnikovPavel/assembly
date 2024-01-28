@@ -58,12 +58,13 @@ read_arg:
     pop %r8
     test %r8, %r8
     jz write_output
-    movb (%r8), %bl # current argument
 
 # decide if we need to parse a number or an operation
     not %r9
     test %r9, %r9
     jnz handle_number
+
+    movb (%r8), %bl # current argument
 
 check_plus:
     cmpb $43, %bl # if argument is `+`
